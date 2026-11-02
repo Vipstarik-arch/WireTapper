@@ -1318,7 +1318,8 @@ def api_flock_query():
 
     GET /api/flock/query?region=FL&bbox=26.24,-80.90,27.05,-79.98&zip=334
     Optional: q=<text>, city=<name> (repeatable), lat/lon/radius, limit,
-    format=json|geojson|csv. Same engine as `wiretaper flock ...`.
+    strict=1 (drop rows whose dataset records no state), format=json|geojson|csv.
+    Same engine as `wiretaper flock ...`.
     """
     try:
         lat = request.args.get('lat', type=float)
@@ -1333,6 +1334,7 @@ def api_flock_query():
             lat=lat, lon=lon, radius_km=radius,
             datasets=[d for d in request.args.getlist('dataset') if d],
             limit=min(request.args.get('limit', default=5000, type=int), 50000),
+            strict_region=request.args.get('strict', 'false').lower() in ('1', 'true', 'yes'),
         )
     except ValueError as exc:
         return jsonify({'status': 'error', 'message': str(exc)}), 400

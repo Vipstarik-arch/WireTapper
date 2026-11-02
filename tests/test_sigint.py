@@ -1077,3 +1077,22 @@ def test_chat_alpr_requires_a_place(stub_http):
     state = {"creds": EMPTY_CREDS, "mode": "all", "radius": 1.0, "limit": 100}
     assert cli.parse_command("alpr", state)["action"] == "error"
     assert cli.parse_command("alpr Boca Raton FL", state)["action"] == "flock_query"
+
+
+def test_flock_search_region_reports_rows_without_a_state():
+    loose = sigint.flock_search(region="FL")
+    strict = sigint.flock_search(region="FL", strict_region=True)
+    assert loose["count"] > strict["count"] > 0
+    # datasets like maximum_dots/DeFlock record no state at all
+    assert loose["region_stated"] == strict["count"] == strict["region_stated"]
+    assert loose["region_unstated"] > 0 and strict["region_unstated"] == 0
+    assert loose["region_stated"] + loose["region_unstated"] == loose["count"]
+    assert all(c["region"] == "FL" for c in strict["devices"])
+    assert "no state recorded" in loose["detail"]
+    assert "no state recorded" not in strict["detail"]
+
+
+def test_flock_search_counters_describe_the_result_set_not_the_scan():
+    res = sigint.flock_search(region="FL", bbox=PBC_BBOX, zip_prefix="334")
+    assert res["region_stated"] + res["region_unstated"] == res["count"]
+    assert res["count"] == 24 and res["region_stated"] == 24

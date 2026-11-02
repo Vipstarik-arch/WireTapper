@@ -682,6 +682,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_flock.add_argument("--city", action="append", help="restrict to city name(s), repeatable")
     p_flock.add_argument("--bbox", help="bounding box: south,west,north,east")
     p_flock.add_argument("--zip-prefix", help='postal-code prefix filter, e.g. "334" for Palm Beach County')
+    p_flock.add_argument("--strict-region", action="store_true",
+                         help="drop rows from datasets that record no state at all")
     p_flock.add_argument("--export", metavar="PATH", help="write results to .csv or .geojson")
     p_flock.set_defaults(radius="10km")  # ALPR data is sparse; 1 km rarely matches
 
@@ -842,7 +844,8 @@ def cmd_flock(args) -> int:
         res = sigint.flock_search(query=query or None, region=region, bbox=args.bbox,
                                  cities=cities, zip_prefix=args.zip_prefix, lat=lat, lon=lon,
                                  radius_km=parse_radius(args.radius) if lat is not None else None,
-                                 datasets=args.dataset, limit=args.limit)
+                                 datasets=args.dataset, limit=args.limit,
+                                 strict_region=args.strict_region)
     elif lat is not None:
         res = sigint.flock_near(lat, lon, radius_km=parse_radius(args.radius),
                                 datasets=args.dataset, limit=args.limit)

@@ -981,7 +981,7 @@ def split_place_state(text):
 
 
 def flock_search(query=None, region=None, bbox=None, cities=None, zip_prefix=None, lat=None,
-                 lon=None, radius_km=None, datasets=None, limit=5000):
+                 lon=None, radius_km=None, datasets=None, limit=5000, strict_region=False):
     """Search the local ALPR/Flock datasets by text, state, bounding box and/or radius.
 
     Unlike :func:`flock_near` this is a *query*, not a proximity scan: it is what
@@ -991,6 +991,11 @@ def flock_search(query=None, region=None, bbox=None, cities=None, zip_prefix=Non
     ``zip_prefix`` takes a comma-separated list of postal prefixes ("334,329") —
     the reliable way to pin down a US county, since a bounding box also catches
     neighbouring counties and many rows have no city recorded.
+
+    Several datasets (maximum_dots, DeFlock) carry no state column at all. By
+    default those rows are *kept* when filtering by region — dropping them would
+    silently hide real matches — but they are counted, reported in ``detail`` and
+    returned as ``region_unstated``; ``strict_region=True`` excludes them.
     """
     try:
         catalog = flock_manager.get_catalog()
@@ -1006,6 +1011,7 @@ def flock_search(query=None, region=None, bbox=None, cities=None, zip_prefix=Non
     text = (query or "").strip().lower()
 
     found, scanned, missing = [], [], []
+    stated = unstated = 0
     for entry in catalog:
         if not entry.get("is_downloaded"):
             missing.append(entry["filename"])
@@ -1034,8 +1040,11 @@ def flock_search(query=None, region=None, bbox=None, cities=None, zip_prefix=Non
             road = str(raw.get("road") or "").strip()
             row_region = str(raw.get("region") or "").strip().upper()
 
-            if region_norm and row_region and row_region != region_norm:
-                continue
+            if region_norm:
+                if row_region and row_region != region_norm:
+                    continue
+                if not row_region and strict_region:
+                    continue
             if box and not (box[0] <= cam_lat <= box[2] and box[1] <= cam_lon <= box[3]):
                 continue
             if lat is not None and lon is not None and radius_km:
@@ -1081,6 +1090,11 @@ def flock_search(query=None, region=None, bbox=None, cities=None, zip_prefix=Non
                 if value not in (None, "") and record.get(field) in (None, ""):
                     record[field] = str(value)
             found.append(record)
+            if region_norm:
+                if row_region:
+                    stated += 1
+                else:
+                    unstated += 1
 
     found.sort(key=lambda d: (d.get("region") or "", d.get("city") or "", d.get("road") or "",
                               d.get("lat") or 0))
@@ -1091,6 +1105,13 @@ def flock_search(query=None, region=None, bbox=None, cities=None, zip_prefix=Non
         filters.append(f"text='{text}'")
     if region_norm:
         filters.append(f"region={region_norm}")
+        if unstated:
+            filters.append(
+                f"{stated} rows state it + {unstated} kept with no state recorded"
+                f" (strict_region excludes those)"
+            )
+        else:
+            filters.append(f"{stated} rows state it")
     if box:
         filters.append(f"bbox={box[0]},{box[1]},{box[2]},{box[3]}")
     if city_needles:
@@ -1103,7 +1124,10 @@ def flock_search(query=None, region=None, bbox=None, cities=None, zip_prefix=Non
               f"scanned {', '.join(scanned) if scanned else 'no local datasets'}")
     if missing:
         detail += f" | not available locally: {', '.join(missing)}"
-    return envelope("flock", "ok" if found else "empty", detail, found)
+    result = envelope("flock", "ok" if found else "empty", detail, found)
+    result["region_stated"] = stated
+    result["region_unstated"] = unstated
+    return result
 
 
 EXPORT_COLUMNS = ["lat", "lon", "region", "city", "road", "name", "brand", "operator",

@@ -250,3 +250,11 @@ def test_flock_query_rejects_a_bad_bbox(client):
 def test_flock_query_empty_result_is_honest(client):
     payload = client.get("/api/flock/query", query_string={**PBC, "zip": "999"}).get_json()
     assert payload["status"] == "empty" and payload["devices"] == []
+
+
+def test_flock_query_strict_region_flag(client):
+    loose = client.get("/api/flock/query", query_string={"region": "FL"}).get_json()
+    strict = client.get("/api/flock/query", query_string={"region": "FL", "strict": "1"}).get_json()
+    assert loose["count"] > strict["count"] > 0
+    assert strict["region_unstated"] == 0
+    assert all(c["region"] == "FL" for c in strict["devices"])
