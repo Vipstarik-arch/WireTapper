@@ -1312,6 +1312,42 @@ def api_flock_cameras():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+@app.route('/api/flock/query', methods=['GET'])
+def api_flock_query():
+    """Query the local ALPR/Flock datasets by place instead of by proximity.
+
+    GET /api/flock/query?region=FL&bbox=26.24,-80.90,27.05,-79.98&zip=334
+    Optional: q=<text>, city=<name> (repeatable), lat/lon/radius, limit,
+    format=json|geojson|csv. Same engine as `wiretaper flock ...`.
+    """
+    try:
+        lat = request.args.get('lat', type=float)
+        lon = request.args.get('lon', type=float)
+        radius = request.args.get('radius', type=float)
+        result = sigint.flock_search(
+            query=request.args.get('q') or request.args.get('query'),
+            region=request.args.get('region') or request.args.get('state'),
+            bbox=request.args.get('bbox'),
+            cities=request.args.getlist('city'),
+            zip_prefix=request.args.get('zip') or request.args.get('zip_prefix'),
+            lat=lat, lon=lon, radius_km=radius,
+            datasets=[d for d in request.args.getlist('dataset') if d],
+            limit=min(request.args.get('limit', default=5000, type=int), 50000),
+        )
+    except ValueError as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 400
+
+    fmt = (request.args.get('format') or 'json').lower()
+    cameras = result['devices']
+    if fmt == 'geojson':
+        return jsonify(sigint.cameras_to_geojson(cameras))
+    if fmt == 'csv':
+        body = sigint.cameras_to_csv(cameras)
+        return app.response_class(body, mimetype='text/csv', headers={
+            'Content-Disposition': 'attachment; filename="flock_query.csv"'})
+    return jsonify(result)
+
+
 @app.route('/api/flock/delete', methods=['POST', 'DELETE'])
 def api_flock_delete():
     data = request.get_json() or {}

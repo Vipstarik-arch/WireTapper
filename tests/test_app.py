@@ -209,3 +209,44 @@ def test_flock_preview_rejects_path_traversal(client):
     res = client.get("/api/flock/preview?filename=../../app.py")
     assert res.status_code in (400, 404, 500)
     assert b"def app" not in res.data
+
+
+PBC = {"region": "FL", "bbox": "26.24,-80.90,27.05,-79.98", "zip": "334"}
+
+
+def test_flock_query_endpoint_finds_palm_beach_county(client):
+    res = client.get("/api/flock/query", query_string=PBC)
+    assert res.status_code == 200
+    payload = res.get_json()
+    assert payload["status"] == "ok" and payload["count"] > 0
+    assert all(str(c.get("postalcode") or "").startswith("334") for c in payload["devices"])
+    assert all(c["type"] == "alpr_camera" for c in payload["devices"])
+
+
+def test_flock_query_geojson_and_csv_formats(client):
+    geo = client.get("/api/flock/query", query_string={**PBC, "format": "geojson"}).get_json()
+    assert geo["type"] == "FeatureCollection" and geo["features"]
+
+    csv_res = client.get("/api/flock/query", query_string={**PBC, "format": "csv"})
+    assert csv_res.status_code == 200
+    assert csv_res.mimetype == "text/csv"
+    body = csv_res.get_data(as_text=True)
+    assert body.splitlines()[0].startswith("lat,lon,region,city,road")
+    assert len(body.strip().splitlines()) - 1 == len(geo["features"])
+
+
+def test_flock_query_by_place_name(client):
+    res = client.get("/api/flock/query", query_string={"q": "Palm Beach", "region": "Florida"})
+    payload = res.get_json()
+    assert res.status_code == 200 and payload["count"] > 0
+
+
+def test_flock_query_rejects_a_bad_bbox(client):
+    res = client.get("/api/flock/query", query_string={"bbox": "nope"})
+    assert res.status_code == 400
+    assert res.get_json()["status"] == "error"
+
+
+def test_flock_query_empty_result_is_honest(client):
+    payload = client.get("/api/flock/query", query_string={**PBC, "zip": "999"}).get_json()
+    assert payload["status"] == "empty" and payload["devices"] == []

@@ -1106,6 +1106,39 @@ def flock_search(query=None, region=None, bbox=None, cities=None, zip_prefix=Non
     return envelope("flock", "ok" if found else "empty", detail, found)
 
 
+EXPORT_COLUMNS = ["lat", "lon", "region", "city", "road", "name", "brand", "operator",
+                  "ssid", "bssid", "netid", "device", "postalcode", "mount_type", "direction",
+                  "zone", "lasttime", "maps_url", "distance_km", "source"]
+
+
+def cameras_to_geojson(cameras) -> dict:
+    """Result set as a GeoJSON FeatureCollection (lon/lat live in the geometry)."""
+    return {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [c["lon"], c["lat"]]},
+                "properties": {k: v for k, v in c.items() if k not in ("lat", "lon")},
+            }
+            for c in cameras or []
+        ],
+    }
+
+
+def cameras_to_csv(cameras) -> str:
+    """Result set as CSV text with a stable column order."""
+    import csv as _csv
+    import io as _io
+
+    buffer = _io.StringIO()
+    writer = _csv.DictWriter(buffer, fieldnames=EXPORT_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for cam in cameras or []:
+        writer.writerow({k: cam.get(k, "") for k in EXPORT_COLUMNS})
+    return buffer.getvalue()
+
+
 def export_cameras(cameras, path):
     """Write search results to CSV or GeoJSON (extension decides the format)."""
     if not cameras:
@@ -1114,29 +1147,13 @@ def export_cameras(cameras, path):
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    ext = os.path.splitext(path)[1].lower()
 
-    if ext == ".geojson":
-        features = [
-            {
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [c["lon"], c["lat"]]},
-                "properties": {k: v for k, v in c.items() if k not in ("lat", "lon")},
-            }
-            for c in cameras
-        ]
+    if os.path.splitext(path)[1].lower() == ".geojson":
         with open(path, "w", encoding="utf-8") as fh:
-            json.dump({"type": "FeatureCollection", "features": features}, fh, indent=1, default=str)
+            json.dump(cameras_to_geojson(cameras), fh, indent=1, default=str)
     else:
-        columns = ["lat", "lon", "region", "city", "road", "name", "brand", "operator",
-                   "ssid", "netid", "device", "postalcode", "mount_type", "direction",
-                   "zone", "lasttime", "maps_url", "source"]
-        import csv as _csv
         with open(path, "w", encoding="utf-8", newline="") as fh:
-            writer = _csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
-            writer.writeheader()
-            for cam in cameras:
-                writer.writerow({k: cam.get(k, "") for k in columns})
+            fh.write(cameras_to_csv(cameras))
 
     return {"status": "ok", "detail": f"wrote {len(cameras)} cameras", "path": path,
             "bytes": os.path.getsize(path)}
