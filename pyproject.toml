@@ -4,23 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wiretaper"
-version = "1.0.0"
+version = "1.1.0"
 description = "Wireless OSINT & Signal Intelligence Platform"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "Flask",
     "requests",
-    "pandas",
-    "openpyxl"
 ]
+
+[project.optional-dependencies]
+# Telemetry importer (CSV/KML/GeoJSON/SQLite/Excel ingestion)
+telemetry = ["pandas", "openpyxl"]
+# Live Bluetooth LE scanning used by /btscan and the `bt` sources
+bluetooth = ["bleak"]
+dev = ["pytest"]
 
 [project.scripts]
 wiretapper = "cli:main"
-wiretaper = "cli:main"
 
 [tool.setuptools]
-py-modules = ["app", "cli", "telemetry_importer", "flock_manager"]
+py-modules = ["app", "cli", "sigint", "telemetry_importer", "flock_manager"]
 
 [tool.setuptools.package-data]
 "*" = ["templates/*", "static/*", "uploads/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

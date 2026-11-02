@@ -1,7 +1,8 @@
-import random
 import requests
 import ssl
+import json
 import os
+import getpass
 import sqlite3
 import time
 import threading
@@ -14,6 +15,7 @@ from werkzeug.utils import secure_filename
 from flask import Flask, request, jsonify, render_template
 import telemetry_importer
 import flock_manager
+import sigint
 
 app = Flask(__name__)
 
@@ -138,6 +140,8 @@ def api_settings():
         if 'censys_secret' in data:
             CENSYS_API_SECRET = data['censys_secret'].strip()
             updates['CENSYS_API_SECRET'] = CENSYS_API_SECRET
+        if 'username' in data:
+            updates['USERNAME'] = str(data['username']).strip()[:64]
         
         # Save to SQLite credentials.db
         saved = set_db_credentials(updates)
@@ -159,8 +163,95 @@ def api_settings():
             'opencellid_key': get_db_credential('OPENCELLID_API_KEY', OPENCELLID_API_KEY),
             'shodan_key': get_db_credential('SHODAN_API_KEY', SHODAN_API_KEY),
             'censys_id': get_db_credential('CENSYS_API_ID', CENSYS_API_ID),
-            'censys_secret': get_db_credential('CENSYS_API_SECRET', CENSYS_API_SECRET)
+            'censys_secret': get_db_credential('CENSYS_API_SECRET', CENSYS_API_SECRET),
+            'username': get_db_credential('USERNAME', '')
         })
+
+# --------------------------------------------------------------------------- #
+# Operator identity, activity log and the in-app chat assistant
+# --------------------------------------------------------------------------- #
+ACTIVITY_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'activity.log')
+
+
+@app.route('/api/username')
+def api_username():
+    """Operator name shown in the UI header (also seeds the `username` cookie)."""
+    name = (
+        get_db_credential('USERNAME', '').strip()
+        or os.environ.get('WIRETAPPER_USER', '').strip()
+        or request.cookies.get('username', '').strip()
+    )
+    if not name:
+        try:
+            name = getpass.getuser()
+        except Exception:
+            name = 'anonymous'
+    response = jsonify({
+        'username': name,
+        'source': 'local operator account',
+        'note': 'Rename with POST /api/settings {"username": "..."}'
+    })
+    response.set_cookie('username', name, max_age=60 * 60 * 24 * 365, samesite='Lax')
+    return response
+
+
+@app.route('/log-activity', methods=['POST'])
+def log_activity():
+    """Append a UI event to the local activity log (JSON lines, git-ignored)."""
+    payload = request.get_json(silent=True)
+    if payload is None:
+        # navigator.sendBeacon posts text/plain
+        try:
+            payload = json.loads(request.get_data(as_text=True) or '{}')
+        except ValueError:
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    entry = {
+        'ts': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'username': payload.get('username') or request.cookies.get('username') or 'anonymous',
+        'page': payload.get('page') or request.referrer or '',
+        'event': payload.get('event') or 'unknown',
+        'details': str(payload.get('details', ''))[:300],
+        'duration': payload.get('duration'),
+        'ip': request.remote_addr,
+    }
+    try:
+        with open(ACTIVITY_LOG, 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    except OSError as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 500
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/chatgpt', methods=['POST'])
+def chat_assistant():
+    """Coordinate-driven assistant behind the in-app chat panel.
+
+    A deterministic local analyst: it reads coordinates / a radius / the wanted
+    sources out of the message, queries the configured sources through
+    `sigint.scan()` and reports exactly what came back — including the sources
+    that stayed silent and why. No external LLM is called, so nothing is
+    invented when a key is missing.
+    """
+    data = request.get_json(silent=True) or {}
+    message = str(data.get('message') or data.get('prompt') or '').strip()
+    if not message:
+        return jsonify({'reply': 'Send coordinates, e.g. `47.2066 27.7950 2km`, or a place name.'}), 400
+
+    try:
+        result = sigint.answer(message, timeout=10)
+    except Exception as exc:
+        return jsonify({'reply': f'Analyst error: {type(exc).__name__}: {exc}'}), 500
+
+    return jsonify({
+        'reply': result['reply'],
+        'engine': 'wiretapper-local-analyst (rule-based, no external LLM)',
+        'web_search': bool(data.get('web_search')),
+        'data': result.get('data', {}),
+    })
+
 
 def check_usb_sdr_status():
     """Checks if a physical USB SDR receiver (e.g. RTL-SDR, HackRF, Airspy) is attached via USB."""
@@ -456,55 +547,16 @@ def nearby():
     devices = []
     
     if mode == 'sdr':
+        # Hardware facts only. WireTapper detects an attached SDR receiver; it
+        # does not capture RF, so no spectrum "devices" are synthesised here.
         sdr_info = check_usb_sdr_status()
-        sdr_dev_name = sdr_info["device"]
-        devices = [
-            {
-                "lat": lat + random.uniform(-0.0015, 0.0015),
-                "lon": lon + random.uniform(-0.0015, 0.0015),
-                "ssid": "ADS-B Flight Transponder (1090 MHz)",
-                "bssid": "ICAO-4B182C",
-                "vendor": f"Aircraft Mode-S / {sdr_dev_name}",
-                "signal": -52,
-                "frequency": "1090 MHz",
-                "timestamp": "2025-04-11T10:05:00Z",
-                "type": "sdr"
-            },
-            {
-                "lat": lat + random.uniform(-0.0015, 0.0015),
-                "lon": lon + random.uniform(-0.0015, 0.0015),
-                "ssid": "Sub-GHz Weather Station (433.92 MHz)",
-                "bssid": "RF-433-SENSOR",
-                "vendor": f"ASK/FSK Telemetry / {sdr_dev_name}",
-                "signal": -68,
-                "frequency": "433.92 MHz",
-                "timestamp": "2025-04-11T10:05:00Z",
-                "type": "sdr"
-            },
-            {
-                "lat": lat + random.uniform(-0.0015, 0.0015),
-                "lon": lon + random.uniform(-0.0015, 0.0015),
-                "ssid": "FM Radio Broadcast Beacon (101.1 MHz)",
-                "bssid": "RF-FM-TOWER",
-                "vendor": f"WFM Audio Carrier / {sdr_dev_name}",
-                "signal": -40,
-                "frequency": "101.1 MHz",
-                "timestamp": "2025-04-11T10:05:00Z",
-                "type": "sdr"
-            },
-            {
-                "lat": lat + random.uniform(-0.0015, 0.0015),
-                "lon": lon + random.uniform(-0.0015, 0.0015),
-                "ssid": "ISM Smart Meter RF (915 MHz)",
-                "bssid": "RF-915-GRID",
-                "vendor": f"LoRa/FSK Node / {sdr_dev_name}",
-                "signal": -74,
-                "frequency": "915 MHz",
-                "timestamp": "2025-04-11T10:05:00Z",
-                "type": "sdr"
-            }
-        ]
-        return jsonify({"devices": devices, "sdr_status": sdr_info})
+        return jsonify({
+            "devices": [],
+            "sdr_status": sdr_info,
+            "mode": "sdr",
+            "note": ("SDR mode reports the attached receiver hardware. WireTapper performs no RF "
+                     "capture, so no signal entries are generated.")
+        })
     elif mode == 'bluetooth':
         # Wigle Bluetooth API call
         try:
@@ -870,21 +922,14 @@ def search():
 
     if mode == 'sdr':
         sdr_info = check_usb_sdr_status()
-        sdr_dev_name = sdr_info["device"]
-        devices = [
-            {
-                "lat": 51.505 + random.uniform(-0.002, 0.002),
-                "lon": -0.09 + random.uniform(-0.002, 0.002),
-                "ssid": f"SDR Signal [{query}]",
-                "bssid": "RF-SDR-BEACON",
-                "vendor": f"Software Defined Radio / {sdr_dev_name}",
-                "signal": -60,
-                "frequency": "433.92 MHz",
-                "timestamp": "2025-04-11T10:05:00Z",
-                "type": "sdr"
-            }
-        ]
-        return jsonify({"devices": devices, "sdr_status": sdr_info})
+        return jsonify({
+            "devices": [],
+            "sdr_status": sdr_info,
+            "query": query,
+            "mode": "sdr",
+            "note": ("SDR mode reports the attached receiver hardware. WireTapper performs no RF "
+                     "capture, so no signal entries are generated.")
+        })
 
     if search_type == 'location':
         try:

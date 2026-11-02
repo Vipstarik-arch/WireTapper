@@ -89,12 +89,67 @@ WireTapper can identify and analyze signals from:
 *   **Flock Safety & ALPR Surveillance Intelligence**: Dedicated management, download, and mapping module for Automated License Plate Reader (ALPR) camera networks and telemetry datasets.
 *   **Multi-Format Telemetry Importer**: Drag-and-drop ingestion and smart column-mapping for custom field reports in CSV, KML, GeoJSON, SQLite (`.db`), and Excel formats.
 *   **IoT & SCADA Infrastructure Reconnaissance**: Real-time geolocation scanning for exposed cameras, IoT nodes, and industrial control systems via Shodan & Censys Search API v2.
-*   **USB SDR Receiver Detection**: Hardware link detection for attached Software Defined Radio dongles (RTL-SDR, HackRF One, Airspy) with frequency range monitoring.
+*   **USB SDR Receiver Detection**: Hardware link detection for attached Software Defined Radio dongles (RTL-SDR, HackRF One, Airspy) with their tuning range. Detection only — WireTapper performs no RF capture, so SDR mode reports the receiver and never invents signals.
 *   **Cellular Infrastructure**: Cell tower location and beacon analysis using WiGLE and OpenCellID databases.
 *   **Vehicles & Consumer Devices**: RF signals from smart vehicles, dashcams, IP cameras, wearables, and IoT appliances.
 
 
 
+
+## 💬 Chat & CLI mode (coordinates in, text out — no browser needed)
+
+The whole intelligence core lives in `sigint.py` and can be driven from a
+terminal. Everything starts from coordinates.
+
+```bash
+pip install -e .            # or just: python3 cli.py <command>
+wiretaper chat              # interactive, coordinate-driven REPL
+```
+
+Inside chat mode (`wt>` prompt):
+
+| You type | What happens |
+| --- | --- |
+| `47.2066 27.7950 2km` | scan every configured source around that point |
+| `wifi 47.2066 27.7950` | Wi-Fi only · same for `bt`, `cell`, `iot`, `flock`, `sdr`, `all` |
+| `where 47.2066 27.7950` | reverse-geocode — what place is this? |
+| `find Ungheni` | geocode a place, then re-use it with `last` |
+| `last` | re-scan the previous coordinates |
+| `ask wifi near 41.0925 -81.5575 within 1km` | free text — the local analyst reads the coordinates, radius and wanted sources out of it (any unrecognised line is treated the same way) |
+| `radius 500m` · `mode flock` · `limit 50` · `json on` | session defaults |
+| `config` · `set SHODAN_API_KEY …` · `test` | credentials (always masked) + connectivity self-test |
+| `datasets` · `import <file>` | local ALPR datasets · telemetry ingestion |
+
+One-shot subcommands for scripting:
+
+```bash
+wiretaper scan   --lat 47.2066 --lon 27.7950 --radius 2km --mode all --json
+wiretaper flock  --lat 41.0925 --lon -81.5575 --radius 3km
+wiretaper where  --lat 47.2066 --lon 27.7950
+wiretaper find   Ungheni Moldova
+wiretaper sdr
+wiretaper import uploads/flock/Flock_Master_Registry.csv
+wiretaper config SHODAN_API_KEY=xxxx
+wiretaper selftest
+wiretaper serve            # the original web UI on :8080
+```
+
+Coordinates are accepted as decimal degrees (`47.2066 27.7950`,
+`47.2066,27.7950`, `47.2066N 27.7950E`) or degrees-minutes
+(`47°12.4'N 27°47.7'E`), with a radius in `m`/`km`/`mi`/`nm` (or `м`/`км`).
+Results are always sorted by distance from the point you gave, and every answer
+lists which sources replied and which stayed silent (no key / unreachable /
+empty) — nothing is ever padded with synthetic devices.
+
+The same analyst answers the in-app chat panel (`POST /chatgpt`); it is a
+deterministic local engine, not an external LLM call.
+
+## 🧪 Development
+
+```bash
+pip install -r WireTapper.txt pytest
+python -m pytest        # offline suite: sigint core, CLI/chat parser and Flask routes
+```
 
 # 🚀 Installation & Configuration
 
@@ -122,6 +177,13 @@ pip install wiretapper
 
 
 ## 🔑 API Services
+
+Copy `.env.example` to `.env` (git-ignored) and fill in the keys you have, or set
+them at runtime — `wiretaper config KEY=VALUE`, `set KEY VALUE` in chat mode, or
+the Settings panel in the web UI. All three write to the same local
+`credentials.db`; lookup order is `credentials.db` → `.env` → environment. A key
+left at its `your_…` placeholder counts as *not configured*, and that source is
+reported as skipped instead of being called. `wiretaper selftest` shows both.
 
 WireTapper integrates with several external intelligence services. Configure API credentials for enhanced discovery capabilities:
 

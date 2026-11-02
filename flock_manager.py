@@ -398,6 +398,22 @@ def get_catalog():
 
     return enriched
 
+def _safe_dataset_path(filename):
+    """Resolve a user-supplied dataset name strictly inside FLOCK_DIR.
+
+    Dataset filenames arrive from query strings and uploads, so they are reduced
+    to a basename and the resolved path is verified to stay inside the dataset
+    directory.  Returns ``None`` for anything that tries to escape it.
+    """
+    if not filename:
+        return None
+    base_dir = os.path.realpath(FLOCK_DIR)
+    candidate = os.path.realpath(os.path.join(base_dir, os.path.basename(str(filename))))
+    if candidate == base_dir or not candidate.startswith(base_dir + os.sep):
+        return None
+    return candidate
+
+
 def download_dataset(dataset_id):
     """Downloads a dataset from catalog or custom URL and saves it to uploads/flock/."""
     target_entry = None
@@ -411,7 +427,9 @@ def download_dataset(dataset_id):
 
     url = target_entry["download_url"]
     filename = target_entry["filename"]
-    save_path = os.path.join(FLOCK_DIR, filename)
+    save_path = _safe_dataset_path(filename)
+    if save_path is None:
+        return {"status": "error", "message": f"Refusing to write outside the dataset directory: {filename}"}
 
     try:
         resp = requests.get(url, headers={'User-Agent': 'WireTapper/1.0'}, timeout=35)
@@ -454,8 +472,8 @@ def download_dataset(dataset_id):
 
 def preview_dataset(filename, page=1, per_page=40):
     """Returns preview metadata, columns, and sample normalized cameras for a dataset."""
-    file_path = os.path.join(FLOCK_DIR, filename)
-    if not os.path.exists(file_path):
+    file_path = _safe_dataset_path(filename)
+    if file_path is None or not os.path.exists(file_path):
         return {"status": "error", "message": f"File '{filename}' not found on server"}
 
     records = load_flock_file_raw_records(file_path)
@@ -502,8 +520,8 @@ def preview_dataset(filename, page=1, per_page=40):
 
 def search_dataset(filename, query, limit=500):
     """Searches within a Flock dataset by keyword (city, state, operator, brand, name, notes)."""
-    file_path = os.path.join(FLOCK_DIR, filename)
-    if not os.path.exists(file_path):
+    file_path = _safe_dataset_path(filename)
+    if file_path is None or not os.path.exists(file_path):
         return {"status": "error", "message": f"File '{filename}' not found"}
 
     records = load_flock_file_raw_records(file_path)
@@ -531,8 +549,8 @@ def search_dataset(filename, query, limit=500):
 
 def get_all_dataset_cameras(filename, limit=15000):
     """Extracts all normalized camera objects from a dataset file for Leaflet map display."""
-    file_path = os.path.join(FLOCK_DIR, filename)
-    if not os.path.exists(file_path):
+    file_path = _safe_dataset_path(filename)
+    if file_path is None or not os.path.exists(file_path):
         return {"status": "error", "message": f"File '{filename}' not found"}
 
     records = load_flock_file_raw_records(file_path)
@@ -554,9 +572,9 @@ def get_all_dataset_cameras(filename, limit=15000):
 def delete_dataset(filename):
     """Deletes a downloaded dataset file from uploads/flock/."""
     safe_name = os.path.basename(filename)
-    file_path = os.path.join(FLOCK_DIR, safe_name)
+    file_path = _safe_dataset_path(filename)
 
-    if not os.path.exists(file_path):
+    if file_path is None or not os.path.exists(file_path):
         return {"status": "error", "message": f"File '{safe_name}' not found"}
 
     try:

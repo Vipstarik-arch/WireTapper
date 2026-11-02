@@ -2,3 +2,6 @@ Flask
 requests
 pandas
 openpyxl
+# Optional: live Bluetooth LE scanning for /btscan and the `bt` source.
+# Install with `pip install bleak` (or `pip install wiretaper[bluetooth]`).
+# bleak
