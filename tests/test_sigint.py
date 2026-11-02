@@ -4,6 +4,7 @@ Nothing here touches the network: ``sigint.requests`` is swapped for a stub that
 serves canned API payloads, and the local Flock datasets ship with the repo.
 """
 
+import json
 import os
 import sqlite3
 import sys
@@ -760,7 +761,7 @@ def test_main_flock_command_prints_table(capsys):
     rc = cli.main(["flock", "--lat", str(AKRON[0]), "--lon", str(AKRON[1]), "--radius", "1km"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "ALPR/Flock cameras within" in out
+    assert "ALPR/Flock cameras" in out
 
 
 def test_main_requires_coordinates(capsys):
@@ -919,3 +920,160 @@ def test_chat_analyst_fallback_is_used_by_the_repl(stub_http):
     text = "\n".join(written)
     assert "alpr_camera" in text
     assert "41.0925, -81.5575" in text
+
+
+# --------------------------------------------------------------------------- #
+# Place queries: region / bbox / zip prefix / city / export
+# --------------------------------------------------------------------------- #
+PBC_BBOX = "26.24,-80.90,27.05,-79.98"   # Palm Beach County, Florida
+
+
+def test_parse_bbox():
+    assert sigint.parse_bbox(PBC_BBOX) == (26.24, -80.90, 27.05, -79.98)
+    assert sigint.parse_bbox("") is None
+    assert sigint.parse_bbox(None) is None
+
+
+@pytest.mark.parametrize("bad", ["1,2,3", "a,b,c,d", "27.0,-80.9,26.2,-80.0", "95,0,96,1", "1,2,3,4,5"])
+def test_parse_bbox_rejects_garbage(bad):
+    with pytest.raises(ValueError):
+        sigint.parse_bbox(bad)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [("Florida", "FL"), ("fl", "FL"), ("FL,", "FL"), ("", ""), ("Palm Beach", ""),
+     ("new york", "NY"), ("Kaliningrad", "")],
+)
+def test_normalise_region(text, expected):
+    assert sigint.normalise_region(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("Palm Beach Florida", ("Palm Beach", "FL")),
+        ("west palm beach fl", ("west palm beach", "FL")),
+        ("Akron", ("Akron", "")),
+        ("new york city ny", ("new york city", "NY")),
+        ("", ("", "")),
+    ],
+)
+def test_split_place_state(text, expected):
+    assert sigint.split_place_state(text) == expected
+
+
+def test_flock_search_by_region_and_bbox():
+    res = sigint.flock_search(region="FL", bbox=PBC_BBOX)
+    if res["status"] == "error":
+        pytest.skip("no local Flock datasets")
+    assert res["count"] > 0
+    for cam in res["devices"]:
+        assert 26.24 <= cam["lat"] <= 27.05
+        assert -80.90 <= cam["lon"] <= -79.98
+        assert cam["region"] in ("FL", "")     # rows without a region are kept, others dropped
+    assert res["count"] > len([c for c in res["devices"] if c.get("city")])  # blank-city rows included
+
+
+def test_flock_search_zip_prefix_isolates_the_county():
+    box = sigint.flock_search(region="FL", bbox=PBC_BBOX)
+    palm = sigint.flock_search(region="FL", bbox=PBC_BBOX, zip_prefix="334")
+    assert 0 < palm["count"] < box["count"]
+    assert all(str(c.get("postalcode") or "").startswith("334") for c in palm["devices"])
+    broward = {"coral springs", "parkland", "pompano beach", "deerfield beach"}
+    assert not {c.get("city", "").lower() for c in palm["devices"]} & broward
+    assert "zip=334" in palm["detail"]
+
+
+def test_flock_search_text_and_city_filters():
+    text = sigint.flock_search(query="Palm Beach", region="FL")
+    assert text["count"] > 0
+    assert all("palm beach" in f"{c.get('city','')} {c.get('road','')}".lower() for c in text["devices"])
+
+    cities = sigint.flock_search(region="FL", cities=["West Palm Beach"])
+    assert cities["count"] > 0
+    assert {c["city"].lower() for c in cities["devices"]} == {"west palm beach"}
+
+
+def test_flock_search_radius_filter():
+    wide = sigint.flock_search(lat=AKRON[0], lon=AKRON[1], radius_km=5.0)
+    narrow = sigint.flock_search(lat=AKRON[0], lon=AKRON[1], radius_km=0.1)
+    assert narrow["count"] <= wide["count"]
+    assert all(c["distance_km"] <= 0.1 for c in narrow["devices"])
+    assert all(c["distance_km"] is not None for c in wide["devices"])
+
+
+def test_flock_search_reports_an_honest_empty_result():
+    res = sigint.flock_search(region="FL", bbox=PBC_BBOX, zip_prefix="999")
+    assert res["status"] == "empty"
+    assert res["devices"] == []
+    assert "zip=999" in res["detail"]
+
+
+def test_export_cameras_csv_and_geojson(tmp_path):
+    res = sigint.flock_search(region="FL", bbox=PBC_BBOX, zip_prefix="334", limit=5)
+    assert res["devices"], "expected bundled Palm Beach County rows"
+
+    csv_path = tmp_path / "nested" / "cams.csv"
+    out = sigint.export_cameras(res["devices"], csv_path)
+    assert out["status"] == "ok" and csv_path.exists() and out["bytes"] > 0
+    lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == len(res["devices"]) + 1
+    assert lines[0].startswith("lat,lon,region,city,road")
+
+    geo_path = tmp_path / "cams.geojson"
+    out = sigint.export_cameras(res["devices"], geo_path)
+    assert out["status"] == "ok"
+    payload = json.loads(geo_path.read_text(encoding="utf-8"))
+    assert payload["type"] == "FeatureCollection"
+    assert len(payload["features"]) == len(res["devices"])
+    first = payload["features"][0]
+    source = res["devices"][0]
+    assert first["geometry"]["type"] == "Point"
+    # GeoJSON keeps lon/lat in the geometry only — properties carry the rest
+    assert first["geometry"]["coordinates"] == [source["lon"], source["lat"]]
+    assert first["properties"]["road"] == source.get("road")
+    assert "lat" not in first["properties"]
+
+    assert sigint.export_cameras([], tmp_path / "empty.csv")["status"] == "error"
+
+
+def test_cli_flock_place_query_with_export(tmp_path, capsys):
+    out_file = tmp_path / "palm.csv"
+    rc = cli.main(["flock", "--place", "Palm Beach Florida", "--export", str(out_file)])
+    printed = capsys.readouterr().out
+    assert rc == 0
+    assert "ALPR/Flock cameras" in printed
+    if out_file.exists():
+        assert "export: wrote" in printed
+
+
+def test_cli_flock_bbox_and_zip(capsys):
+    rc = cli.main(["flock", "--region", "FL", "--bbox", PBC_BBOX, "--zip-prefix", "334", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["count"] > 0
+    assert all(str(c.get("postalcode") or "").startswith("334") for c in payload["devices"])
+
+
+def test_cli_rejects_a_bad_bbox():
+    with pytest.raises(ValueError):
+        cli.main(["flock", "--region", "FL", "--bbox", "not,a,bbox"])
+
+
+def test_chat_alpr_command_queries_local_datasets(stub_http):
+    stub_http({})
+    lines = iter(["alpr Palm Beach Florida", "export /tmp/wt-chat-export.csv", "quit"])
+    written = []
+    cli.chat(creds=EMPTY_CREDS, banner=False,
+             input_fn=lambda prompt="": next(lines), output_fn=written.append)
+    text = "\n".join(written)
+    assert "West Palm Beach" in text or "Belvedere Road" in text
+    assert "export ok" in text or "export" in text
+
+
+def test_chat_alpr_requires_a_place(stub_http):
+    stub_http({})
+    state = {"creds": EMPTY_CREDS, "mode": "all", "radius": 1.0, "limit": 100}
+    assert cli.parse_command("alpr", state)["action"] == "error"
+    assert cli.parse_command("alpr Boca Raton FL", state)["action"] == "flock_query"

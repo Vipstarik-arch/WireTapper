@@ -118,13 +118,19 @@ Inside chat mode (`wt>` prompt):
 | `ask wifi near 41.0925 -81.5575 within 1km` | free text — the local analyst reads the coordinates, radius and wanted sources out of it (any unrecognised line is treated the same way) |
 | `radius 500m` · `mode flock` · `limit 50` · `json on` | session defaults |
 | `config` · `set SHODAN_API_KEY …` · `test` | credentials (always masked) + connectivity self-test |
-| `datasets` · `import <file>` | local ALPR datasets · telemetry ingestion |
+| `alpr <place> [state]` | road/ALPR cameras for a place — `alpr Palm Beach Florida` |
+| `export <file.csv\|.geojson>` | write the last result set to a file |
+| `datasets` · `download <id>` · `import <file>` | local ALPR datasets · fetch a catalog dataset · telemetry ingestion |
 
 One-shot subcommands for scripting:
 
 ```bash
 wiretaper scan   --lat 47.2066 --lon 27.7950 --radius 2km --mode all --json
 wiretaper flock  --lat 41.0925 --lon -81.5575 --radius 3km
+wiretaper flock  --place "Palm Beach Florida"                       # by place name
+wiretaper flock  --region FL --bbox 26.24,-80.90,27.05,-79.98 --zip-prefix 334 \
+                 --export exports/palm_beach_alpr.csv               # county-wide + export
+wiretaper flock-download deflock_us_master                          # fetch a catalog dataset
 wiretaper where  --lat 47.2066 --lon 27.7950
 wiretaper find   Ungheni Moldova
 wiretaper sdr
@@ -143,6 +149,13 @@ empty) — nothing is ever padded with synthetic devices.
 
 The same analyst answers the in-app chat panel (`POST /chatgpt`); it is a
 deterministic local engine, not an external LLM call.
+
+ALPR queries accept four filters that combine freely: `--query` (free text over
+city/road/SSID/MAC/notes), `--region` (`FL` or `Florida`), `--bbox`
+(`south,west,north,east`) and `--zip-prefix` (`334` = Palm Beach County). A
+bounding box alone also catches neighbouring counties and many rows carry no
+city, so the postal prefix is what pins a county down; `--city` narrows further.
+`--export` writes the result set as `.csv` or `.geojson`.
 
 ## 🧪 Development
 

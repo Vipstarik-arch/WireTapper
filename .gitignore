@@ -20,6 +20,9 @@ credentials.db-journal
 # UI event log written by POST /log-activity
 activity.log
 
+# Query exports written by `--export` / chat `export`
+exports/
+
 # User-imported telemetry (the bundled ALPR datasets under uploads/flock stay tracked)
 uploads/*.csv
 uploads/*.kml

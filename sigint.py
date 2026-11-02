@@ -904,6 +904,252 @@ def flock_near(lat, lon, radius_km=25.0, datasets=None, limit=250) -> dict:
     return envelope("flock", "ok" if found else "empty", detail, found[:limit])
 
 
+# US state names -> postal abbreviations, so "Florida" and "FL" both work.
+STATE_ABBREV = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
+    "colorado": "CO", "connecticut": "CT", "delaware": "DE", "florida": "FL", "georgia": "GA",
+    "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA",
+    "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT",
+    "virginia": "VA", "washington": "WA", "west virginia": "WV", "wisconsin": "WI",
+    "wyoming": "WY", "district of columbia": "DC",
+}
+_STATE_BY_ABBREV = {v: v for v in STATE_ABBREV.values()}
+
+
+def parse_bbox(text):
+    """Parse ``"south,west,north,east"`` (OSM order) into ``(lat_min, lon_min, lat_max, lon_max)``."""
+    if not text:
+        return None
+    parts = [p.strip() for p in str(text).replace(";", ",").split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError("bbox needs four numbers: south,west,north,east (e.g. 26.23,-80.90,27.00,-80.00)")
+    try:
+        south, west, north, east = (float(p) for p in parts)
+    except ValueError:
+        raise ValueError("bbox values must be numbers: south,west,north,east")
+    if not (-90 <= south <= 90 and -90 <= north <= 90 and -180 <= west <= 180 and -180 <= east <= 180):
+        raise ValueError("bbox out of range")
+    if south > north or west > east:
+        raise ValueError("bbox must be south<=north and west<=east")
+    return south, west, north, east
+
+
+def normalise_region(text):
+    """``Florida`` / ``fl`` / ``FL,`` -> ``FL``; anything unrecognised -> ``""``."""
+    token = str(text or "").strip().lower().rstrip(".,;")
+    if not token:
+        return ""
+    if token in STATE_ABBREV:
+        return STATE_ABBREV[token]
+    upper = token.upper()
+    if upper in _STATE_BY_ABBREV:
+        return upper
+    return ""
+
+
+# Raw fields worth keeping next to the normalised camera record.
+_FLOCK_RAW_FIELDS = ("region", "city", "road", "postalcode", "housenumber", "ssid", "netid",
+                     "device", "mfgrid", "capabilities", "firsttime", "lasttime", "lastupdt",
+                     "country", "type", "operator", "brand", "notes", "maps_url")
+
+
+def split_place_state(text):
+    """Split ``"Palm Beach Florida"`` into ``("palm beach", "FL")``.
+
+    Handles two-word state names and postal abbreviations; returns ``""`` as the
+    region when the text carries no state.
+    """
+    tokens = str(text or "").strip().split()
+    if not tokens:
+        return "", ""
+    if len(tokens) >= 2:
+        two = " ".join(tokens[-2:]).lower().rstrip(".,;")
+        if two in STATE_ABBREV:
+            return " ".join(tokens[:-2]).strip(), STATE_ABBREV[two]
+    last = tokens[-1].lower().rstrip(".,;")
+    if last in STATE_ABBREV:
+        return " ".join(tokens[:-1]).strip(), STATE_ABBREV[last]
+    if last.upper() in _STATE_BY_ABBREV:
+        return " ".join(tokens[:-1]).strip(), last.upper()
+    return str(text).strip(), ""
+
+
+def flock_search(query=None, region=None, bbox=None, cities=None, zip_prefix=None, lat=None,
+                 lon=None, radius_km=None, datasets=None, limit=5000):
+    """Search the local ALPR/Flock datasets by text, state, bounding box and/or radius.
+
+    Unlike :func:`flock_near` this is a *query*, not a proximity scan: it is what
+    you want for "find every road camera in Palm Beach County, Florida".
+
+    ``region`` accepts ``FL`` or ``Florida``.  ``bbox`` is ``south,west,north,east``.
+    ``zip_prefix`` takes a comma-separated list of postal prefixes ("334,329") —
+    the reliable way to pin down a US county, since a bounding box also catches
+    neighbouring counties and many rows have no city recorded.
+    """
+    try:
+        catalog = flock_manager.get_catalog()
+    except Exception as exc:  # pragma: no cover - defensive
+        return envelope("flock", "error", f"Could not read the Flock catalog: {exc}")
+
+    wanted = {d.lower() for d in datasets} if datasets else None
+    region_norm = normalise_region(region) if region else ""
+    box = parse_bbox(bbox) if bbox else None
+    city_needles = [c.strip().lower() for c in (cities or []) if c.strip()]
+    zip_prefixes = [str(z).strip() for z in str(zip_prefix or "").replace(";", ",").split(",")
+                    if z.strip()]
+    text = (query or "").strip().lower()
+
+    found, scanned, missing = [], [], []
+    for entry in catalog:
+        if not entry.get("is_downloaded"):
+            missing.append(entry["filename"])
+            continue
+        if wanted and entry["filename"].lower() not in wanted and entry["id"].lower() not in wanted:
+            continue
+        try:
+            raw_records = flock_manager.load_flock_file_raw_records(
+                os.path.join(flock_manager.FLOCK_DIR, entry["filename"])
+            )
+        except Exception as exc:
+            missing.append(f"{entry['filename']} ({exc})")
+            continue
+        scanned.append(f"{entry['filename']}:{len(raw_records)}")
+
+        for idx, row in enumerate(raw_records):
+            cam = flock_manager.normalize_camera_record(row, idx, entry["filename"])
+            if not cam:
+                continue
+            cam_lat, cam_lon = _f(cam.get("lat")), _f(cam.get("lon"))
+            if cam_lat is None or cam_lon is None:
+                continue
+
+            raw = row if isinstance(row, dict) else {}
+            city = str(raw.get("city") or "").strip()
+            road = str(raw.get("road") or "").strip()
+            row_region = str(raw.get("region") or "").strip().upper()
+
+            if region_norm and row_region and row_region != region_norm:
+                continue
+            if box and not (box[0] <= cam_lat <= box[2] and box[1] <= cam_lon <= box[3]):
+                continue
+            if lat is not None and lon is not None and radius_km:
+                if haversine_km(lat, lon, cam_lat, cam_lon) > radius_km:
+                    continue
+            if city_needles and not any(n in city.lower() for n in city_needles):
+                continue
+            if zip_prefixes:
+                postal = str(raw.get("postalcode") or "").strip()
+                if not any(postal.startswith(prefix) for prefix in zip_prefixes):
+                    continue
+            if text:
+                blob = " ".join(
+                    str(raw.get(k) or cam.get(k) or "")
+                    for k in ("name", "city", "road", "ssid", "netid", "operator", "brand",
+                              "notes", "description", "postalcode", "device", "info/comments")
+                ).lower()
+                if text not in blob:
+                    continue
+
+            record = {
+                "lat": cam_lat,
+                "lon": cam_lon,
+                "distance_km": (round(haversine_km(lat, lon, cam_lat, cam_lon), 4)
+                                if lat is not None and lon is not None else None),
+                "ssid": cam.get("name"),
+                "name": cam.get("name"),
+                "bssid": str(raw.get("netid") or "") or None,
+                "brand": cam.get("brand"),
+                "operator": cam.get("operator"),
+                "mount_type": cam.get("mount_type"),
+                "direction": cam.get("direction"),
+                "zone": cam.get("zone"),
+                "maps_url": cam.get("maps_url"),
+                "city": city,
+                "road": road,
+                "region": row_region,
+                "type": "alpr_camera",
+                "source": f"flock:{entry['filename']}",
+            }
+            for field in _FLOCK_RAW_FIELDS:
+                value = raw.get(field)
+                if value not in (None, "") and record.get(field) in (None, ""):
+                    record[field] = str(value)
+            found.append(record)
+
+    found.sort(key=lambda d: (d.get("region") or "", d.get("city") or "", d.get("road") or "",
+                              d.get("lat") or 0))
+    found = found[:limit]
+
+    filters = []
+    if text:
+        filters.append(f"text='{text}'")
+    if region_norm:
+        filters.append(f"region={region_norm}")
+    if box:
+        filters.append(f"bbox={box[0]},{box[1]},{box[2]},{box[3]}")
+    if city_needles:
+        filters.append("cities=" + "|".join(city_needles))
+    if zip_prefixes:
+        filters.append("zip=" + "|".join(zip_prefixes))
+    if lat is not None and radius_km:
+        filters.append(f"radius={radius_km}km@{lat},{lon}")
+    detail = (f"{len(found)} matches ({', '.join(filters) or 'no filter'}) · "
+              f"scanned {', '.join(scanned) if scanned else 'no local datasets'}")
+    if missing:
+        detail += f" | not available locally: {', '.join(missing)}"
+    return envelope("flock", "ok" if found else "empty", detail, found)
+
+
+def export_cameras(cameras, path):
+    """Write search results to CSV or GeoJSON (extension decides the format)."""
+    if not cameras:
+        return {"status": "error", "detail": "nothing to export", "path": None}
+    path = os.path.expanduser(str(path))
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".geojson":
+        features = [
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [c["lon"], c["lat"]]},
+                "properties": {k: v for k, v in c.items() if k not in ("lat", "lon")},
+            }
+            for c in cameras
+        ]
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"type": "FeatureCollection", "features": features}, fh, indent=1, default=str)
+    else:
+        columns = ["lat", "lon", "region", "city", "road", "name", "brand", "operator",
+                   "ssid", "netid", "device", "postalcode", "mount_type", "direction",
+                   "zone", "lasttime", "maps_url", "source"]
+        import csv as _csv
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for cam in cameras:
+                writer.writerow({k: cam.get(k, "") for k in columns})
+
+    return {"status": "ok", "detail": f"wrote {len(cameras)} cameras", "path": path,
+            "bytes": os.path.getsize(path)}
+
+
+def flock_download(dataset_id):
+    """Download one catalog dataset (needs egress to the dataset host)."""
+    try:
+        return flock_manager.download_dataset(dataset_id)
+    except Exception as exc:  # pragma: no cover - network dependent
+        return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
+
+
 def flock_datasets() -> dict:
     """Catalog of ALPR datasets with local availability and record counts."""
     try:

@@ -55,10 +55,11 @@ STATUS_GLYPH = {"ok": "+", "empty": "-", "skipped": "!", "error": "x"}
 # Small formatting helpers
 # --------------------------------------------------------------------------- #
 def _cell(value, width, align="<"):
+    """Pad/truncate one table cell to a fixed width (``…`` marks a cut)."""
     text = "-" if value is None or value == "" else str(value)
     if len(text) > width:
-        text = text[: width - 1] + "\u2026"
-    return format(text, align)
+        text = text[: max(width - 1, 1)] + "\u2026"
+    return format(text, f"{align}{width}")
 
 
 def _fmt_distance(km):
@@ -94,32 +95,52 @@ def render_devices(devices, limit=25, wide=False) -> str:
 
     if wide:
         header = (
-            f"{_cell('#', 4)}{_cell('dist', 9, '>')}  {_cell('type', 11)}"
-            f"{_cell('name', 34)}{_cell('id', 20)}{_cell('sig', 6, '>')}  {_cell('detail', 40)}"
+            f"{_cell('#', 4)}{_cell('dist', 9, '>')}  {_cell('type', 12)}{_cell('name / road', 34)} "
+            f"{_cell('id', 19)}{_cell('sig', 6, '>')}  {_cell('detail', 40)}"
         )
         out.append(header)
         out.append("-" * len(header))
         for i, d in enumerate(rows, 1):
             detail = d.get("vendor") or d.get("info") or d.get("operator") or d.get("notes") or ""
+            label = d.get("ssid") or d.get("name")
+            ident = d.get("bssid") or d.get("netid") or d.get("cell_id") or d.get("ip") or d.get("id")
             if d.get("encryption"):
                 detail = f"{d['encryption']} · {detail}"
             if d.get("ip"):
                 detail = f"{d.get('ip')}:{d.get('port')} · {detail}"
+            if d.get("type") == "alpr_camera":
+                label = d.get("road") or label
+                zip_code = str(d.get("postalcode") or "")[:5]
+                seen = str(d.get("lasttime") or "")[:10]
+                detail = " · ".join(
+                    part for part in (
+                        d.get("city"), d.get("region"),
+                        f"zip {zip_code}" if zip_code else "",
+                        f"last seen {seen}" if seen else "",
+                    ) if part
+                )
             out.append(
                 f"{_cell(i, 4)}{_cell(_fmt_distance(d.get('distance_km')), 9, '>')}  "
-                f"{_cell(d.get('type'), 11)}{_cell(d.get('ssid') or d.get('name'), 34)}"
-                f"{_cell(d.get('bssid') or d.get('cell_id') or d.get('ip') or d.get('id'), 20)}"
+                f"{_cell(d.get('type'), 12)}{_cell(label, 34)} "
+                f"{_cell(ident, 19)}"
                 f"{_cell(d.get('signal'), 6, '>')}  {_cell(detail, 40)}"
             )
     else:
         for i, d in enumerate(rows, 1):
-            ident = d.get("bssid") or d.get("cell_id") or d.get("ip") or d.get("id") or ""
+            ident = d.get("bssid") or d.get("netid") or d.get("cell_id") or d.get("ip") or d.get("id") or ""
             extra = d.get("encryption") or d.get("radio") or d.get("product") or d.get("operator") or ""
+            label = d.get("ssid") or d.get("name")
             if d.get("type") == "alpr_camera":
-                extra = d.get("brand") or extra
+                # road + municipality is what identifies a road camera
+                label = d.get("road") or label
+                place = " ".join(
+                    p for p in (d.get("city") or "", d.get("region") or "",
+                                str(d.get("postalcode") or "")[:5]) if p
+                ).strip()
+                extra = place or extra
             line = (
                 f"{i:>3}. {_fmt_distance(d.get('distance_km')):>9}  "
-                f"{_cell(d.get('type'), 12)} {_cell(d.get('ssid') or d.get('name'), 36)} "
+                f"{_cell(d.get('type'), 12)} {_cell(label, 36)} "
                 f"{_cell(ident, 20)}"
             )
             if extra:
@@ -237,6 +258,18 @@ def parse_command(line: str, state: dict) -> dict:
         return {"action": "import", "path": rest_text}
     if head in ("datasets", "flock-list"):
         return {"action": "flock_datasets"}
+    if head in ("alpr", "cameras", "roadcams"):
+        if not rest_text:
+            return {"action": "error", "message": "usage: alpr <place> [state] e.g. `alpr Palm Beach Florida`"}
+        return {"action": "flock_query", "text": rest_text}
+    if head == "export":
+        if not rest_text:
+            return {"action": "error", "message": "usage: export <path.csv|path.geojson>"}
+        return {"action": "export", "path": rest_text}
+    if head == "download":
+        if not rest_text:
+            return {"action": "error", "message": "usage: download <dataset id> (see flock-list)"}
+        return {"action": "download", "dataset_id": rest_text}
     if head in ("ask", "q", "?q"):
         if not rest_text:
             return {"action": "error", "message": "usage: ask <question with coordinates or a place name>"}
@@ -409,6 +442,32 @@ def execute(command: dict, state: dict, creds=None) -> str:
             state["last_coords"] = coords
         return reply
 
+    if action == "flock_query":
+        text = command.get("text", "")
+        query, region = sigint.split_place_state(text)
+        res = sigint.flock_search(query=query or None, region=region or None)
+        state["last_export"] = res["devices"]
+        if state.get("json"):
+            return sigint.to_json(res)
+        header = f"ALPR/Flock cameras matching {text!r} — {res['count']} found"
+        return "\n".join([header, res["detail"],
+                          render_devices(res["devices"], limit=state.get("limit_display", 25),
+                                         wide=state.get("wide", False))])
+
+    if action == "export":
+        rows = state.get("last_export")
+        if not rows:
+            return "! nothing to export yet — run a scan or an `alpr <place>` query first"
+        out = sigint.export_cameras(rows, command["path"])
+        return f"export {out['status']}: {out['detail']} -> {out.get('path')}" if out["status"] == "ok" \
+            else f"! export failed: {out['detail']}"
+
+    if action == "download":
+        res = sigint.flock_download(command["dataset_id"])
+        if state.get("json"):
+            return sigint.to_json(res)
+        return f"download {res.get('status')}: {res.get('message')}"
+
     if action == "flock_datasets":
         res = sigint.flock_datasets()
         if state.get("json"):
@@ -464,6 +523,7 @@ def execute(command: dict, state: dict, creds=None) -> str:
         modes = tuple(command.get("modes") or ("wifi",))
         result = sigint.scan(lat, lon, radius_km=radius, modes=modes, creds=creds,
                              limit=state.get("limit", 100))
+        state["last_export"] = result["devices"]
         if state.get("json"):
             return sigint.to_json(result)
         return render_scan(result, limit=state.get("limit_display", 25), wide=state.get("wide", False))
@@ -481,7 +541,10 @@ HELP_TEXT = """WireTapper chat mode — everything is driven by coordinates.
   last                     re-scan the previous coordinates
   ask <free text>          natural-language query, e.g. `ask wifi near 47.2066 27.7950 2km`
                            (any line that is not a command is treated the same way)
+  alpr <place> [state]     road/ALPR cameras for a place, e.g. `alpr Palm Beach Florida`
+  export <file.csv|.geojson>  write the last result set to a file
   flock-list               which ALPR datasets are available locally
+  download <dataset id>    fetch a catalog dataset (needs internet egress)
   import <file>            inspect a CSV/KML/GeoJSON/SQLite/Excel telemetry file
   sdr                      report the attached USB SDR receiver (hardware facts only)
 
@@ -613,7 +676,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_flock = sub.add_parser("flock", help="ALPR / Flock Safety cameras near coordinates (offline datasets)")
     _add_common(p_flock)
     p_flock.add_argument("--dataset", action="append", help="restrict to dataset filename(s) or id(s)")
+    p_flock.add_argument("--place", help='place + state, e.g. "Palm Beach Florida"')
+    p_flock.add_argument("--query", help="free-text filter over city/road/SSID/name/notes")
+    p_flock.add_argument("--region", help="US state (FL or Florida)")
+    p_flock.add_argument("--city", action="append", help="restrict to city name(s), repeatable")
+    p_flock.add_argument("--bbox", help="bounding box: south,west,north,east")
+    p_flock.add_argument("--zip-prefix", help='postal-code prefix filter, e.g. "334" for Palm Beach County')
+    p_flock.add_argument("--export", metavar="PATH", help="write results to .csv or .geojson")
     p_flock.set_defaults(radius="10km")  # ALPR data is sparse; 1 km rarely matches
+
+    p_dl = sub.add_parser("flock-download", help="download a catalog ALPR dataset (needs egress)")
+    p_dl.add_argument("dataset_id")
+    p_dl.add_argument("--json", action="store_true")
 
     p_where = sub.add_parser("where", help="reverse-geocode coordinates into a place name")
     p_where.add_argument("--lat", type=float, required=True)
@@ -680,6 +754,7 @@ def main(argv=None) -> int:
         "chat": cmd_chat,
         "scan": cmd_scan,
         "flock": cmd_flock,
+        "flock-download": cmd_flock_download,
         "where": cmd_where,
         "find": cmd_find,
         "sdr": cmd_sdr,
@@ -752,16 +827,52 @@ def cmd_scan(args) -> int:
 
 
 def cmd_flock(args) -> int:
-    lat, lon = _coords_or_die(args)
-    radius = parse_radius(args.radius)
-    res = sigint.flock_near(lat, lon, radius_km=radius, datasets=args.dataset, limit=args.limit)
+    query_mode = any([args.query, args.region, args.bbox, args.city, args.place, args.zip_prefix])
+    lat = lon = None
+    if args.lat is not None or args.lon is not None:
+        lat, lon = _coords_or_die(args)
+
+    region, cities = args.region, list(args.city or [])
+    query = args.query or ""
+    if args.place:
+        query, place_region = sigint.split_place_state(args.place)
+        region = region or place_region
+
+    if query_mode:
+        res = sigint.flock_search(query=query or None, region=region, bbox=args.bbox,
+                                 cities=cities, zip_prefix=args.zip_prefix, lat=lat, lon=lon,
+                                 radius_km=parse_radius(args.radius) if lat is not None else None,
+                                 datasets=args.dataset, limit=args.limit)
+    elif lat is not None:
+        res = sigint.flock_near(lat, lon, radius_km=parse_radius(args.radius),
+                                datasets=args.dataset, limit=args.limit)
+    else:
+        raise SystemExit(
+            "give either coordinates (--lat/--lon) or a query "
+            "(--place \"Palm Beach Florida\", --query/--region/--bbox/--city)"
+        )
+
     if args.json:
         print(sigint.to_json(res))
-        return 0
-    print(f"ALPR/Flock cameras within {_fmt_distance(radius)} of {lat}, {lon} — {res['count']} found")
-    print(res["detail"])
-    print(render_devices(res["devices"], limit=args.limit, wide=args.wide))
+    else:
+        print(f"ALPR/Flock cameras — {res['count']} found")
+        print(res["detail"])
+        print(render_devices(res["devices"], limit=args.limit, wide=args.wide))
+    if args.export and res["devices"]:
+        out = sigint.export_cameras(res["devices"], args.export)
+        print(f"export: {out['detail']} -> {out['path']} ({out.get('bytes', 0)} bytes)")
     return 0
+
+
+def cmd_flock_download(args) -> int:
+    res = sigint.flock_download(args.dataset_id)
+    if args.json:
+        print(sigint.to_json(res))
+    else:
+        print(f"{res.get('status')}: {res.get('message')}")
+        if res.get("camera_count") is not None:
+            print(f"  cameras parsed: {res['camera_count']} of {res.get('total_records')} records")
+    return 0 if res.get("status") == "success" else 1
 
 
 def cmd_where(args) -> int:
