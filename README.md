@@ -157,6 +157,17 @@ bounding box alone also catches neighbouring counties and many rows carry no
 city, so the postal prefix is what pins a county down; `--city` narrows further.
 `--export` writes the result set as `.csv` or `.geojson`.
 
+The same query is available over HTTP, so it can be opened as a direct link or
+piped into another tool:
+
+```
+GET /api/flock/query?region=FL&bbox=26.24,-80.90,27.05,-79.98&zip=334
+    [&format=json|geojson|csv] [&q=<text>] [&city=<name>] [&lat=&lon=&radius=]
+```
+
+A malformed `bbox` returns `400` with the reason; a valid query with no matches
+returns `200` and `{"status": "empty", "devices": []}`.
+
 ## 🧪 Development
 
 ```bash
